@@ -1,0 +1,35 @@
+spring:
+  application:
+    name: spring-ai-agent-demo
+
+  ai:
+    openai:
+      # 没有配置真实 Key 时应用也能启动，方便先看页面；调用模型时会返回鉴权错误提示。
+      api-key: ${OPENAI_API_KEY:demo-key}
+      # 不要带 /v1 后缀，Spring AI 会自动拼接 /v1/chat/completions
+      base-url: ${OPENAI_BASE_URL:https://api.openai.com}
+      chat:
+        options:
+          model: ${OPENAI_CHAT_MODEL:gpt-4o-mini}
+          temperature: 0.6
+      embedding:
+        options:
+          model: ${OPENAI_EMBEDDING_MODEL:text-embedding-3-small}
+
+server:
+  port: ${PORT:8080}
+
+app:
+  rag:
+    # 使用的模型服务不支持 Embedding 时可设为 false，关闭知识库检索
+    enabled: ${RAG_ENABLED:true}
+    top-k: 4
+    similarity-threshold: 0.5
+  react:
+    # agent ⇄ tools 的最大循环轮数，防止模型陷入无限工具调用
+    max-iterations: ${REACT_MAX_ITERATIONS:8}
+
+logging:
+  level:
+    org.springframework.ai: INFO
+    com.example.springaiagent: INFO
