@@ -1,0 +1,14 @@
+src/main/java/com/example/springaiagent/service/AgentService.java
+  h_82b3248fceb535 1-348
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.51-trip",
+  "base_commit_sha": "f28caa49ebd92c9f02cd91daeb675322cf5531ef",
+  "prompts": {},
+  "humans": {
+    "h_82b3248fceb535": {
+      "author": "wangyongqing <wangyongqing@trip.com>"
+    }
+  }
+}
