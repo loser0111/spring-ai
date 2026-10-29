@@ -671,6 +671,138 @@
             font-size: 10.5px;
         }
 
+        /* ---------------- Approval dialog ---------------- */
+
+        .approval-mask {
+            position: fixed;
+            inset: 0;
+            z-index: 80;
+            display: grid;
+            place-items: center;
+            padding: 24px;
+            background: rgba(22, 38, 30, 0.42);
+            backdrop-filter: blur(3px);
+        }
+
+        .approval-mask[hidden] { display: none; }
+
+        .approval-dialog {
+            width: min(560px, 100%);
+            max-height: min(80vh, 720px);
+            overflow: auto;
+            padding: 22px 22px 18px;
+            background: var(--paper-2);
+            border: 1px solid var(--line-strong);
+            border-radius: 20px;
+            box-shadow: 0 30px 80px rgba(20, 32, 25, 0.28);
+            animation: rise 0.22s ease both;
+        }
+
+        .approval-dialog h3 {
+            margin: 0 0 6px;
+            font-family: var(--serif);
+            font-size: 20px;
+            font-weight: 600;
+        }
+
+        .approval-sub {
+            margin: 0 0 16px;
+            color: var(--ink-soft);
+            font-size: 13px;
+            line-height: 1.6;
+        }
+
+        .approval-calls {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .approval-call {
+            padding: 10px 12px;
+            border: 1px solid var(--line);
+            border-radius: 12px;
+            background: rgba(255, 255, 255, 0.55);
+        }
+
+        .approval-call-head {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 6px;
+        }
+
+        .approval-call-head strong { font-size: 13px; }
+
+        .approval-call-head code {
+            font-family: var(--mono);
+            font-size: 11px;
+            color: var(--muted);
+        }
+
+        .approval-call pre {
+            margin: 0;
+            padding: 8px 10px;
+            border-radius: 8px;
+            background: var(--paper);
+            color: var(--ink-soft);
+            font-family: var(--mono);
+            font-size: 11.5px;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .approval-remember {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin: 14px 0 2px;
+            color: var(--ink-soft);
+            font-size: 12.5px;
+            cursor: pointer;
+        }
+
+        .approval-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+            margin-top: 16px;
+        }
+
+        .approval-actions button {
+            padding: 9px 16px;
+            border: 1px solid var(--line-strong);
+            border-radius: 10px;
+            background: var(--paper-2);
+            color: var(--ink);
+            font-size: 13px;
+            cursor: pointer;
+        }
+
+        .approval-actions button:hover { border-color: var(--pine-2); }
+
+        .approval-actions .approval-allow {
+            background: var(--pine);
+            border-color: var(--pine);
+            color: #f2f7f3;
+        }
+
+        .approval-actions .approval-allow:hover { background: var(--pine-2); }
+
+        .approval-hint {
+            min-height: 14px;
+            margin-top: 10px;
+            font-size: 11px;
+            color: var(--muted);
+        }
+
+        .approval-wait {
+            color: var(--muted);
+            font-size: 13px;
+        }
+
         /* ---------------- Empty state ---------------- */
 
         .empty {
@@ -920,6 +1052,23 @@
     </main>
 </div>
 
+<div class="approval-mask" id="approvalMask" hidden>
+    <div class="approval-dialog" role="dialog" aria-modal="true" aria-labelledby="approvalTitle">
+        <h3 id="approvalTitle">需要你的确认</h3>
+        <p class="approval-sub">以下工具调用会访问数据或产生副作用，允许后才会执行。</p>
+        <div class="approval-calls" id="approvalCalls"></div>
+        <label class="approval-remember">
+            <input type="checkbox" id="approvalRemember">
+            <span>本次会话内不再询问这些工具</span>
+        </label>
+        <div class="approval-actions">
+            <button type="button" id="approvalDeny">拒绝</button>
+            <button type="button" class="approval-allow" id="approvalAllow">允许执行</button>
+        </div>
+        <div class="approval-hint" id="approvalHint"></div>
+    </div>
+</div>
+
 <script>
 (() => {
     'use strict';
@@ -938,7 +1087,13 @@
         kbSources: document.getElementById('kbSources'),
         checkpointList: document.getElementById('checkpointList'),
         threadHint: document.getElementById('threadHint'),
-        busyHint: document.getElementById('busyHint')
+        busyHint: document.getElementById('busyHint'),
+        approvalMask: document.getElementById('approvalMask'),
+        approvalCalls: document.getElementById('approvalCalls'),
+        approvalRemember: document.getElementById('approvalRemember'),
+        approvalAllow: document.getElementById('approvalAllow'),
+        approvalDeny: document.getElementById('approvalDeny'),
+        approvalHint: document.getElementById('approvalHint')
     };
 
     const state = {
@@ -947,6 +1102,9 @@
         meta: null,
         metaAttempts: 0
     };
+
+    let pendingApproval = null;
+    let runToken = 0;
 
     function makeId() {
         return 'c-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
@@ -1166,6 +1324,110 @@
         scrollToBottom();
     }
 
+    function showApproval(approval, ui) {
+        removeThinking(ui);
+        if (ui && ui.textEl && !ui.raw) {
+            ui.textEl.innerHTML = '<span class="approval-wait">已暂停，等待你确认工具调用。</span>';
+        }
+
+        pendingApproval = {approval: approval, ui: ui};
+        els.approvalCalls.innerHTML = '';
+        (approval.calls || []).forEach(call => {
+            const item = document.createElement('div');
+            item.className = 'approval-call';
+
+            const head = document.createElement('div');
+            head.className = 'approval-call-head';
+            const label = document.createElement('strong');
+            label.textContent = call.label || call.name;
+            const code = document.createElement('code');
+            code.textContent = call.name;
+            head.appendChild(label);
+            head.appendChild(code);
+
+            const pre = document.createElement('pre');
+            pre.textContent = call.input || '{}';
+
+            item.appendChild(head);
+            item.appendChild(pre);
+            els.approvalCalls.appendChild(item);
+        });
+
+        els.approvalRemember.checked = false;
+        els.approvalHint.textContent = approval.expiresAt
+            ? '确认请求有效期至 ' + new Date(approval.expiresAt).toLocaleTimeString()
+            : '';
+        els.approvalMask.hidden = false;
+        els.approvalAllow.focus();
+        setBusy(state.busy);
+        scrollToBottom();
+    }
+
+    function resolveApproval(approved) {
+        if (!pendingApproval) {
+            return;
+        }
+        const approval = pendingApproval.approval;
+        const remember = els.approvalRemember.checked;
+        pendingApproval = null;
+        els.approvalMask.hidden = true;
+
+        const ui = addAssistantTurn();
+        ui.turn.querySelector('.assistant-name').textContent = approved
+            ? '已授权 · 继续执行'
+            : '已拒绝 · 让模型调整';
+        runApprovalStream(approval, approved, remember, ui);
+    }
+
+    async function runApprovalStream(approval, approved, remember, ui) {
+        const token = ++runToken;
+        setBusy(true);
+        try {
+            const response = await fetch('/api/approvals/' + encodeURIComponent(approval.approvalId), {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'text/event-stream'
+                },
+                body: JSON.stringify({approved: approved, rememberSession: remember})
+            });
+
+            if (!response.ok || !response.body) {
+                const detail = await response.text().catch(() => '');
+                throw new Error('HTTP ' + response.status + (detail ? '：' + detail : ''));
+            }
+
+            await consumeSse(response, (eventName, payload) => handleEvent(eventName, payload, ui));
+        } catch (error) {
+            showError(ui, '继续执行失败：' + (error && error.message ? error.message : error));
+        } finally {
+            finalizeUi(ui);
+            if (token === runToken) {
+                setBusy(false);
+                els.input.focus();
+            }
+            loadCheckpoints();
+            scrollToBottom();
+        }
+    }
+
+    function finalizeUi(ui) {
+        removeThinking(ui);
+        if (ui.frame) {
+            cancelAnimationFrame(ui.frame);
+            ui.frame = null;
+        }
+        if (ui.raw) {
+            ui.textEl.innerHTML = renderMarkdown(ui.raw);
+            if (ui.errorMessage) {
+                const box = document.createElement('div');
+                box.className = 'error-box';
+                box.textContent = ui.errorMessage;
+                ui.textEl.appendChild(box);
+            }
+        }
+    }
+
     function shortId(id) {
         return String(id || '').slice(0, 8);
     }
@@ -1242,10 +1504,14 @@
                 throw new Error(data.error || ('HTTP ' + response.status));
             }
 
-            ui.raw = data.reply || '';
-            ui.textEl.innerHTML = renderMarkdown(ui.raw || '（该检查点之后没有新的输出）');
-            renderSources(ui, data.sources || []);
             ui.checkpointEl.textContent = '回放自检查点 #' + shortId(checkpointId);
+            if (data.approval) {
+                showApproval(data.approval, ui);
+            } else {
+                ui.raw = data.reply || '';
+                ui.textEl.innerHTML = renderMarkdown(ui.raw || '（该检查点之后没有新的输出）');
+                renderSources(ui, data.sources || []);
+            }
             await loadCheckpoints();
         } catch (error) {
             showError(ui, '回放失败：' + (error && error.message ? error.message : error));
@@ -1277,6 +1543,8 @@
                 ui.checkpointEl.textContent = '检查点已保存 · #' + shortId(data.checkpointId);
             }
             loadCheckpoints();
+        } else if (eventName === 'approval') {
+            showApproval(data, ui);
         } else if (eventName === 'error') {
             showError(ui, data.message || '未知错误');
         } else if (eventName === 'meta') {
@@ -1324,17 +1592,18 @@
 
     function setBusy(busy) {
         state.busy = busy;
-        els.send.disabled = busy;
-        els.busyHint.textContent = busy ? '正在生成…' : '';
-        els.input.disabled = busy;
+        const locked = busy || !!pendingApproval;
+        els.send.disabled = locked;
+        els.busyHint.textContent = busy ? '正在生成…' : (pendingApproval ? '等待确认…' : '');
+        els.input.disabled = locked;
         els.checkpointList.querySelectorAll('button').forEach(button => {
-            button.disabled = busy;
+            button.disabled = locked;
         });
     }
 
     async function sendMessage(text) {
         const message = (text || '').trim();
-        if (!message || state.busy) {
+        if (!message || state.busy || pendingApproval) {
             return;
         }
 
@@ -1348,6 +1617,7 @@
         els.input.value = '';
         autoresize();
 
+        const token = ++runToken;
         const ui = addAssistantTurn();
 
         try {
@@ -1372,22 +1642,11 @@
         } catch (error) {
             showError(ui, '请求失败：' + (error && error.message ? error.message : error));
         } finally {
-            removeThinking(ui);
-            if (ui.frame) {
-                cancelAnimationFrame(ui.frame);
-                ui.frame = null;
+            finalizeUi(ui);
+            if (token === runToken) {
+                setBusy(false);
+                els.input.focus();
             }
-            if (ui.raw) {
-                ui.textEl.innerHTML = renderMarkdown(ui.raw);
-                if (ui.errorMessage) {
-                    const box = document.createElement('div');
-                    box.className = 'error-box';
-                    box.textContent = ui.errorMessage;
-                    ui.textEl.appendChild(box);
-                }
-            }
-            setBusy(false);
-            els.input.focus();
             loadCheckpoints();
             scrollToBottom();
         }
@@ -1447,6 +1706,9 @@
         sendMessage(els.input.value);
     });
 
+    els.approvalAllow.addEventListener('click', () => resolveApproval(true));
+    els.approvalDeny.addEventListener('click', () => resolveApproval(false));
+
     els.input.addEventListener('input', autoresize);
     els.input.addEventListener('keydown', event => {
         if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
@@ -1456,7 +1718,7 @@
     });
 
     els.newChat.addEventListener('click', () => {
-        if (state.busy) {
+        if (state.busy || pendingApproval) {
             return;
         }
         state.conversationId = makeId();

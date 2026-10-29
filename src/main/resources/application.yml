@@ -5,13 +5,13 @@ spring:
   ai:
     openai:
       # 没有配置真实 Key 时应用也能启动，方便先看页面；调用模型时会返回鉴权错误提示。
-      api-key: ${OPENAI_API_KEY:demo-key}
+      api-key: sk-cb6d5cd501c543d8b9a6734e2752d821
       # 不要带 /v1 后缀，Spring AI 会自动拼接 /v1/chat/completions
-      base-url: ${OPENAI_BASE_URL:https://api.openai.com}
+      base-url: https://api.deepseek.com
       chat:
         options:
-          model: ${OPENAI_CHAT_MODEL:gpt-4o-mini}
-          temperature: 0.6
+          model: deepseek-flash
+          temperature: 0.1
       embedding:
         options:
           model: ${OPENAI_EMBEDDING_MODEL:text-embedding-3-small}
@@ -28,6 +28,9 @@ app:
   react:
     # agent ⇄ tools 的最大循环轮数，防止模型陷入无限工具调用
     max-iterations: ${REACT_MAX_ITERATIONS:8}
+  approval:
+    # 工具确认请求的有效期（秒），过期后的确认会按拒绝处理
+    ttl-seconds: ${APPROVAL_TTL_SECONDS:600}
 
 logging:
   level:

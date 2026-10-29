@@ -57,6 +57,11 @@ public class CheckpointController {
             @PathVariable String checkpointId,
             @RequestParam String conversationId) {
         String threadId = normalize(conversationId);
+        if (agentService.hasPendingApproval(threadId)) {
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("error", "该会话还有未处理的工具确认请求，请先允许或拒绝。");
+            return Mono.just(ResponseEntity.status(HttpStatus.CONFLICT).body(body));
+        }
 
         return Mono.fromCallable(() -> {
                     ChatResult result = agentService.resume(threadId, checkpointId);
@@ -65,6 +70,9 @@ public class CheckpointController {
                     body.put("checkpointId", checkpointId);
                     body.put("reply", result.reply());
                     body.put("sources", result.sources());
+                    if (result.approval() != null) {
+                        body.put("approval", result.approval());
+                    }
                     return ResponseEntity.ok(body);
                 })
                 .subscribeOn(Schedulers.boundedElastic())

@@ -15,6 +15,7 @@ import com.alibaba.cloud.ai.graph.state.strategy.ReplaceStrategy;
 import com.example.springaiagent.agent.AgentErrors;
 import com.example.springaiagent.agent.AgentEvent;
 import com.example.springaiagent.agent.AgentEventBus;
+import com.example.springaiagent.approval.ApprovalService;
 import com.example.springaiagent.tools.CalculatorTools;
 import com.example.springaiagent.tools.TimeTools;
 import com.example.springaiagent.tools.TodoTools;
@@ -42,6 +43,7 @@ import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -60,6 +62,18 @@ public class AgentService {
     private static final String NODE_TOOLS = "tools";
     private static final String ROUTE_END = "end";
 
+    /**
+     * 工具名 -> 给用户看的中文名，用于确认弹窗。
+     */
+    private static final Map<String, String> TOOL_LABELS = Map.of(
+            "getCurrentDateTime", "查询当前时间",
+            "getTimeInZone", "查询时区时间",
+            "getWeather", "查询城市天气",
+            "calculate", "计算表达式",
+            "addTodo", "添加待办",
+            "listTodos", "查看待办",
+            "completeTodo", "完成待办");
+
     private static final String BASE_SYSTEM_PROMPT = """
             你是「Spring AI 小助手」，一个基于 ReAct 模式的网页版智能体。
 
@@ -77,6 +91,7 @@ public class AgentService {
     private final ChatMemory chatMemory;
     private final KnowledgeBaseService knowledgeBase;
     private final AgentEventBus agentEventBus;
+    private final ApprovalService approvalService;
     private final List<ToolCallback> toolCallbacks;
     private final Map<String, ToolCallback> callbacksByName;
     private final String modelName;
@@ -89,6 +104,7 @@ public class AgentService {
             ChatMemory chatMemory,
             KnowledgeBaseService knowledgeBase,
             AgentEventBus agentEventBus,
+            ApprovalService approvalService,
             TimeTools timeTools,
             CalculatorTools calculatorTools,
             WeatherTools weatherTools,
@@ -100,6 +116,7 @@ public class AgentService {
         this.chatMemory = chatMemory;
         this.knowledgeBase = knowledgeBase;
         this.agentEventBus = agentEventBus;
+        this.approvalService = approvalService;
         this.modelName = modelName;
         this.temperature = temperature;
         this.maxIterations = maxIterations;
@@ -120,17 +137,21 @@ public class AgentService {
      * prepare → agent ──有工具调用──→ tools ──→ agent
      *                └──没有工具调用──→ END
      *
-     * 每个节点执行后 MemorySaver 都会保存一份状态快照，因此工具循环的每一步都能回放。
+     * <p>编译时配置了 interruptBefore(tools)：每次执行工具前都会停下来，
+     * 由 {@link #advanceUntilBlocked} 决定是直接放行（会话已授权）还是推一条确认请求给前端。
+     * 每个节点执行后 MemorySaver 都会保存一份状态快照，因此工具循环的每一步都能回放。</p>
      */
     private CompiledGraph buildGraph() {
         try {
             AsyncEdgeAction routeAfterAgent = state ->
                     CompletableFuture.completedFuture(readText(state, "next", ROUTE_END));
 
+            // StateGraph 的 addNode 只接受 AsyncNodeAction（返回 CompletableFuture），
+            // 所以这里把同步的节点方法包一层。
             StateGraph graph = new StateGraph(keyStrategies())
-                    .addNode(NODE_PREPARE, state -> prepare(state))
-                    .addNode(NODE_AGENT, state -> agent(state))
-                    .addNode(NODE_TOOLS, state -> tools(state))
+                    .addNode(NODE_PREPARE, state -> CompletableFuture.completedFuture(prepare(state)))
+                    .addNode(NODE_AGENT, state -> CompletableFuture.completedFuture(agent(state)))
+                    .addNode(NODE_TOOLS, state -> CompletableFuture.completedFuture(tools(state)))
                     .addEdge(StateGraph.START, NODE_PREPARE)
                     .addEdge(NODE_PREPARE, NODE_AGENT)
                     .addConditionalEdges(
@@ -143,6 +164,8 @@ public class AgentService {
                     .saverConfig(SaverConfig.builder()
                             .register(new MemorySaver())
                             .build())
+                    // 工具执行前暂停，等待用户确认；确认后从检查点恢复进 tools 节点。
+                    .interruptBefore(NODE_TOOLS)
                     .build();
 
             return graph.compile(compileConfig);
@@ -186,10 +209,11 @@ public class AgentService {
      */
     public ChatResult chat(String message, String conversationId, String turnId) {
         try {
-            Optional<OverAllState> result = compiledGraph.invoke(
-                    inputs(message, conversationId, turnId),
-                    RunnableConfig.builder().threadId(conversationId).build());
-            return toChatResult(result);
+            RunnableConfig config = RunnableConfig.builder().threadId(conversationId).build();
+            Outcome outcome = advanceUntilBlocked(
+                    compiledGraph.invoke(inputs(message, conversationId, turnId), config),
+                    config, conversationId, turnId);
+            return toChatResult(outcome);
         } catch (Exception e) {
             throw new IllegalStateException("Graph 执行失败：" + e.getMessage(), e);
         }
@@ -197,6 +221,7 @@ public class AgentService {
 
     /**
      * 从指定检查点回放：复用同一个 threadId 对应的状态，从 checkpointId 继续执行。
+     * 如果回放途中又要调用工具，会再次生成确认请求。
      */
     public ChatResult resume(String conversationId, String checkpointId) {
         try {
@@ -204,8 +229,9 @@ public class AgentService {
                     .threadId(conversationId)
                     .checkPointId(checkpointId)
                     .build();
-            Optional<OverAllState> result = compiledGraph.invoke(Map.of(), config);
-            return toChatResult(result);
+            Outcome outcome = advanceUntilBlocked(
+                    compiledGraph.invoke(Map.of(), config), config, conversationId, null);
+            return toChatResult(outcome);
         } catch (Exception e) {
             throw new IllegalStateException("从检查点回放失败：" + e.getMessage(), e);
         }
@@ -217,7 +243,7 @@ public class AgentService {
     public List<String> checkpointIds(String conversationId) {
         try {
             RunnableConfig config = RunnableConfig.builder().threadId(conversationId).build();
-            List<StateSnapshot> history = compiledGraph.getStateHistory(config);
+            Collection<StateSnapshot> history = compiledGraph.getStateHistory(config);
             if (history == null) {
                 return List.of();
             }
@@ -234,9 +260,9 @@ public class AgentService {
     private void runGraph(String message, String conversationId, String turnId) {
         try {
             RunnableConfig config = RunnableConfig.builder().threadId(conversationId).build();
-            compiledGraph.invoke(inputs(message, conversationId, turnId), config);
-            latestCheckpoint(config).ifPresent(checkpointId ->
-                    agentEventBus.emit(turnId, new AgentEvent.Checkpoint(checkpointId)));
+            advanceUntilBlocked(
+                    compiledGraph.invoke(inputs(message, conversationId, turnId), config),
+                    config, conversationId, turnId);
         } catch (Exception e) {
             log.warn("ReAct Graph 执行失败", e);
             agentEventBus.emit(turnId, new AgentEvent.Error(AgentErrors.friendly(e)));
@@ -245,13 +271,150 @@ public class AgentService {
         }
     }
 
+    /**
+     * 用户在确认接口里做出决定后，流式继续执行这一轮。
+     */
+    public Flux<AgentEvent> decide(String approvalId, boolean approved, boolean remember) {
+        return Flux.defer(() -> {
+            Optional<ApprovalService.Pending> consumed = approvalService.consumePending(approvalId);
+            if (consumed.isEmpty()) {
+                return Flux.just(new AgentEvent.Error("确认请求不存在、已被处理或已过期。"));
+            }
+            ApprovalService.Pending pending = consumed.get();
+            boolean expired = pending.expiresAt() < System.currentTimeMillis();
+            boolean effectiveApproved = approved && !expired;
+            boolean effectiveRemember = effectiveApproved && remember;
+            if (approved && expired) {
+                log.info("确认请求已过期，按拒绝处理（turnId={}）", pending.turnId());
+            }
+            agentEventBus.open(pending.turnId());
+            Mono.fromRunnable(() -> resumeAfterDecision(
+                            pending, effectiveApproved, effectiveRemember))
+                    .subscribeOn(Schedulers.boundedElastic())
+                    .subscribe();
+            return agentEventBus.events(pending.turnId());
+        });
+    }
+
+    /**
+     * 该会话是否还有未处理的确认请求。有的话不允许发起新消息，
+     * 否则会从“等待确认”的检查点继续，而不是开始新一轮。
+     */
+    public boolean hasPendingApproval(String conversationId) {
+        return approvalService.hasPending(conversationId);
+    }
+
+    private void resumeAfterDecision(ApprovalService.Pending pending, boolean approved, boolean remember) {
+        try {
+            if (approved && remember) {
+                approvalService.grant(pending.conversationId(), pending.calls());
+            }
+            approvalService.putDecision(pending.turnId(), approved);
+
+            // 该会话在等待确认期间不允许发起新请求，因此最新检查点就是
+            // “暂停在 tools 前”的那个快照，按 threadId 恢复即可。
+            RunnableConfig config = RunnableConfig.builder()
+                    .threadId(pending.conversationId())
+                    .build();
+            advanceUntilBlocked(compiledGraph.invoke(Map.of(), config), config,
+                    pending.conversationId(), pending.turnId());
+        } catch (Exception e) {
+            approvalService.consumeDecision(pending.turnId());
+            log.warn("确认后继续执行失败", e);
+            agentEventBus.emit(pending.turnId(), new AgentEvent.Error(AgentErrors.friendly(e)));
+        } finally {
+            agentEventBus.complete(pending.turnId());
+        }
+    }
+
+    /**
+     * 处理 Graph 在 tools 节点前的暂停。
+     *
+     * <p>如果该会话已经授权了全部待执行工具，就直接补一个“允许”决定并继续跑；
+     * 否则生成确认请求推给前端，本轮结束。用户决定后由 {@link #decide} 恢复。</p>
+     */
+    private Outcome advanceUntilBlocked(Optional<OverAllState> initial, RunnableConfig config,
+                                        String conversationId, String fallbackTurnId) {
+        Optional<OverAllState> result = initial;
+        for (int round = 0; round <= maxIterations; round++) {
+            if (result.isEmpty() || !awaitingApproval(result.get())) {
+                emitCheckpoint(config, turnIdOf(result.orElse(null), fallbackTurnId));
+                return new Outcome(result, null);
+            }
+
+            OverAllState state = result.get();
+            String turnId = turnIdOf(state, fallbackTurnId);
+            List<AgentEvent.ApprovalCall> calls = approvalCalls(state);
+            if (calls.isEmpty()) {
+                log.warn("Graph 在 tools 前暂停，但 state 中没有待执行的工具调用，按结束处理");
+                emitCheckpoint(config, turnId);
+                return new Outcome(result, null);
+            }
+
+            if (approvalService.isFullyGranted(conversationId, calls)) {
+                approvalService.putDecision(turnId, true);
+                result = compiledGraph.invoke(Map.of(), config);
+                continue;
+            }
+
+            AgentEvent.Approval approval = approvalService.create(conversationId, turnId, calls);
+            agentEventBus.emit(turnId, approval);
+            emitCheckpoint(config, turnId);
+            return new Outcome(result, approval);
+        }
+        throw new IllegalStateException("工具确认循环超过最大轮数（" + maxIterations + "），已终止");
+    }
+
+    private boolean awaitingApproval(OverAllState state) {
+        return NODE_TOOLS.equals(readText(state, "next", ""));
+    }
+
+    private List<AgentEvent.ApprovalCall> approvalCalls(OverAllState state) {
+        List<AgentEvent.ApprovalCall> calls = new ArrayList<>();
+        for (Map<String, Object> call : pendingToolCalls(readTranscript(state))) {
+            String name = asText(call.get("name"));
+            calls.add(new AgentEvent.ApprovalCall(
+                    asText(call.get("id")),
+                    name,
+                    labelOf(name),
+                    asText(call.getOrDefault("arguments", "{}"))));
+        }
+        return calls;
+    }
+
+    private static String labelOf(String name) {
+        return TOOL_LABELS.getOrDefault(name, name);
+    }
+
+    private String turnIdOf(OverAllState state, String fallback) {
+        String safeFallback = fallback == null ? "" : fallback;
+        if (state == null) {
+            return safeFallback;
+        }
+        String turnId = readText(state, "turnId", safeFallback);
+        return turnId == null || turnId.isBlank() ? safeFallback : turnId;
+    }
+
+    private void emitCheckpoint(RunnableConfig config, String turnId) {
+        if (turnId == null || turnId.isBlank()) {
+            return;
+        }
+        latestCheckpoint(config).ifPresent(checkpointId ->
+                agentEventBus.emit(turnId, new AgentEvent.Checkpoint(checkpointId)));
+    }
+
+    private record Outcome(Optional<OverAllState> state, AgentEvent.Approval approval) {
+    }
+
     private Optional<String> latestCheckpoint(RunnableConfig config) {
         try {
-            List<StateSnapshot> history = compiledGraph.getStateHistory(config);
+            Collection<StateSnapshot> history = compiledGraph.getStateHistory(config);
             if (history == null || history.isEmpty()) {
                 return Optional.empty();
             }
-            return history.get(0).config().checkPointId();
+            return history.stream()
+                    .findFirst()
+                    .flatMap(snapshot -> snapshot.config().checkPointId());
         } catch (Exception e) {
             log.debug("读取最新检查点失败：{}", e.toString());
             return Optional.empty();
@@ -345,6 +508,13 @@ public class AgentService {
         List<Map<String, Object>> transcript = readTranscript(state);
         List<Map<String, Object>> pendingCalls = pendingToolCalls(transcript);
 
+        // 决定只消费一次，作用于本批全部工具调用；缺失时按拒绝处理，避免绕过确认。
+        Boolean approved = approvalService.consumeDecision(turnId);
+        boolean allowed = Boolean.TRUE.equals(approved);
+        if (approved == null) {
+            log.warn("tools 节点没有拿到确认结果，按拒绝处理（turnId={}）", turnId);
+        }
+
         for (Map<String, Object> call : pendingCalls) {
             String id = asText(call.get("id"));
             String name = asText(call.get("name"));
@@ -354,6 +524,9 @@ public class AgentService {
             String result;
             if (callback == null) {
                 result = "未找到工具：" + name;
+            } else if (!allowed) {
+                result = "用户拒绝了这次工具调用（" + labelOf(name) + "），操作未执行。"
+                        + "请根据用户的选择调整回答，不要假装已经执行。";
             } else {
                 try {
                     result = callback.call(arguments, new ToolContext(Map.of(
@@ -446,11 +619,14 @@ public class AgentService {
             if (!(item instanceof Map<?, ?> map)) {
                 continue;
             }
+            // Map<?, ?> 的 getOrDefault 第二个参数是捕获类型，不能直接传 String，这里手动补默认值。
+            Object type = map.get("type");
+            Object arguments = map.get("arguments");
             calls.add(new AssistantMessage.ToolCall(
                     asText(map.get("id")),
-                    asText(map.getOrDefault("type", "function")),
+                    type == null ? "function" : asText(type),
                     asText(map.get("name")),
-                    asText(map.getOrDefault("arguments", "{}"))));
+                    arguments == null ? "{}" : asText(arguments)));
         }
         return calls;
     }
@@ -553,14 +729,14 @@ public class AgentService {
         return value == null ? "" : String.valueOf(value);
     }
 
-    private ChatResult toChatResult(Optional<OverAllState> result) {
-        if (result.isEmpty()) {
-            return new ChatResult("", List.of());
+    private ChatResult toChatResult(Outcome outcome) {
+        if (outcome.state().isEmpty()) {
+            return new ChatResult("", List.of(), outcome.approval());
         }
-        OverAllState state = result.get();
+        OverAllState state = outcome.state().get();
         String answer = readText(state, "answer", "");
         Object sources = state.value("sources", List.of());
-        return new ChatResult(answer, extractSources(sources));
+        return new ChatResult(answer, extractSources(sources), outcome.approval());
     }
 
     private List<AgentEvent.Source> extractSources(Object raw) {
@@ -573,10 +749,12 @@ public class AgentService {
                 sources.add(source);
             } else if (item instanceof Map<?, ?> map) {
                 int index = map.get("index") instanceof Number number ? number.intValue() : sources.size() + 1;
+                Object source = map.get("source");
+                Object snippet = map.get("snippet");
                 sources.add(new AgentEvent.Source(
                         index,
-                        String.valueOf(map.getOrDefault("source", "unknown.md")),
-                        String.valueOf(map.getOrDefault("snippet", ""))));
+                        source == null ? "unknown.md" : String.valueOf(source),
+                        snippet == null ? "" : String.valueOf(snippet)));
             }
         }
         return List.copyOf(sources);

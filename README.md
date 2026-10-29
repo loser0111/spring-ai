@@ -16,6 +16,7 @@
 - **引用可追溯**：回答标注 `[1]`、`[2]`，页面展示对应文档与片段摘要。
 - **工具过程可视化**：工具的开始 / 结果 / 错误通过 SSE 实时推送，前端渲染成卡片。
 - **节点级检查点**：`prepare`、每次 `agent`、每次 `tools` 执行后都由 `MemorySaver` 保存状态；侧边栏可以查看检查点并从历史检查点回放。
+- **工具执行前确认**：Graph 在 `tools` 节点前中断，前端弹窗展示工具名与参数；允许后从检查点继续，拒绝则把结果回给模型重新决策，支持「本次会话内不再询问」。
 - **零前端构建**：一个 `index.html`，无 npm、无打包步骤。
 
 ## 快速开始
@@ -83,6 +84,7 @@ SSE 事件：
 | `meta` | 会话 ID、turnId、RAG 是否就绪 |
 | `sources` | 本轮检索到的知识库片段 |
 | `tool` | 工具调用开始 / 结束 / 失败，带参数和结果 |
+| `approval` | 工具执行前的确认请求，带 `approvalId` 和待执行调用 |
 | `delta` | 模型输出的文本增量 |
 | `checkpoint` | 本轮 Graph 执行完成后保存的检查点 ID |
 | `error` | 可读的错误信息 |
@@ -147,6 +149,20 @@ curl -s -X POST \
 
 返回 `reply` 和 `sources`。回放会用同一个 `threadId` 和对应 `checkPointId` 继续执行 Graph，因此检查点之后的节点会重新运行。
 
+### 工具确认（Human-in-the-loop）
+
+Graph 编译时配置了 `interruptBefore(tools)`，每次执行工具前都会暂停并保存检查点。前端收到 `approval` 事件后弹窗展示工具名、参数和有效期，用户决定后调用：
+
+```bash
+curl -N -X POST http://localhost:8080/api/approvals/{approvalId} \
+  -H 'Content-Type: application/json' \
+  -d '{"approved":true,"rememberSession":false}'
+```
+
+接口返回与 `/api/chat/stream` 相同格式的 SSE 流：工具卡片、文本增量、检查点、`done`。拒绝时不会执行工具，而是把「用户拒绝」作为工具结果写回 transcript，让模型调整回答；`rememberSession=true` 会在当前会话内记住这批工具，之后不再弹窗。
+
+确认请求一次性使用，默认 10 分钟过期（`APPROVAL_TTL_SECONDS`）；过期后再点确认会按「拒绝」处理，让 Graph 正常收尾。存在未处理确认时，同一会话的新消息和检查点回放会返回错误，避免从「等待确认」的状态误继续。
+
 ## 项目结构
 
 ```
@@ -155,21 +171,24 @@ spring-ai/
 ├── src/main/java/com/example/springaiagent/
 │   ├── SpringAiAgentApplication.java
 │   ├── agent/
-│   │   ├── AgentEvent.java          # 流式事件：文本 / 引用 / 检查点 / 错误
+│   │   ├── AgentEvent.java          # 流式事件：文本 / 引用 / 检查点 / 确认 / 错误
 │   │   ├── AgentEventBus.java       # 按 turnId 推送 Agent 事件
 │   │   ├── AgentErrors.java         # 异常转可读提示
 │   │   ├── ToolEvent.java           # 工具调用事件
 │   │   ├── ToolCall.java
 │   │   ├── ToolEventBus.java        # 按 turnId 收集并推送工具事件
 │   │   └── ToolEventPublisher.java  # 工具埋点辅助类
+│   ├── approval/ApprovalService.java # 待确认请求、会话授权、一次性决定
 │   ├── config/AgentConfig.java      # ChatMemory、VectorStore
 │   ├── service/
-│   │   ├── AgentService.java        # ReAct StateGraph、checkpoint、RAG、工具循环
+│   │   ├── AgentService.java        # ReAct StateGraph、checkpoint、RAG、工具循环、中断恢复
 │   │   ├── KnowledgeBaseService.java
 │   │   └── ChatResult.java
 │   ├── tools/                       # 时间 / 计算器 / 天气 / 待办
 │   └── web/
 │       ├── ChatController.java      # SSE、同步接口、meta
+│       ├── ApprovalController.java  # 确认决定后从检查点恢复的 SSE 接口
+│       ├── SseWriter.java           # 统一的 SSE 序列化
 │       └── CheckpointController.java # 检查点列表 / 回放
 └── src/main/resources/
     ├── application.yml
@@ -203,6 +222,7 @@ spring-ai/
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | 向量模型 |
 | `RAG_ENABLED` | `true` | 是否启用知识库 |
 | `REACT_MAX_ITERATIONS` | `8` | agent ⇄ tools 最大循环轮数 |
+| `APPROVAL_TTL_SECONDS` | `600` | 工具确认请求有效期（秒） |
 | `PORT` | `8080` | 服务端口 |
 
 知识库参数在 `application.yml` 的 `app.rag` 下：`top-k`（默认 4）、`similarity-threshold`（默认 0.5）。检索不到足够相似的片段时不会注入资料，模型会直接基于通用知识回答。

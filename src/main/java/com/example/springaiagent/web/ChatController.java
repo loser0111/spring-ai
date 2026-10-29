@@ -7,8 +7,6 @@ import com.example.springaiagent.agent.ToolEventBus;
 import com.example.springaiagent.service.AgentService;
 import com.example.springaiagent.service.ChatResult;
 import com.example.springaiagent.service.KnowledgeBaseService;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -25,10 +23,7 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.UUID;
+import java.util.*;
 
 @RestController
 @RequestMapping("/api")
@@ -40,7 +35,7 @@ public class ChatController {
     private final ToolEventBus eventBus;
     private final AgentEventBus agentEventBus;
     private final KnowledgeBaseService knowledgeBase;
-    private final ObjectMapper objectMapper;
+    private final SseWriter sse;
     private final String modelName;
 
     public ChatController(
@@ -48,39 +43,44 @@ public class ChatController {
             ToolEventBus eventBus,
             AgentEventBus agentEventBus,
             KnowledgeBaseService knowledgeBase,
-            ObjectMapper objectMapper,
+            SseWriter sse,
             @Value("${spring.ai.openai.chat.options.model:unknown}") String modelName) {
         this.agentService = agentService;
         this.eventBus = eventBus;
         this.agentEventBus = agentEventBus;
         this.knowledgeBase = knowledgeBase;
-        this.objectMapper = objectMapper;
+        this.sse = sse;
         this.modelName = modelName;
     }
 
     /**
-     * 流式对话，SSE 事件：meta / sources / tool / delta / error / done。
+     * 流式对话，SSE 事件：meta / sources / tool / approval / delta / error / done。
      */
     @PostMapping(value = "/chat/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public Flux<ServerSentEvent<String>> stream(@RequestBody ChatRequest request) {
         String message = request.safeMessage();
         if (message.isBlank()) {
-            return Flux.just(sse("error", Map.of("message", "消息不能为空")));
+            return Flux.just(sse.event("error", Map.of("message", "消息不能为空")));
         }
 
         String conversationId = request.safeConversationId();
+        if (agentService.hasPendingApproval(conversationId)) {
+            return Flux.just(sse.event("error",
+                    Map.of("message", "该会话还有未处理的工具确认请求，请先允许或拒绝。")));
+        }
+
         String turnId = UUID.randomUUID().toString();
         eventBus.open(turnId);
 
         Flux<ServerSentEvent<String>> toolEvents = eventBus.events(turnId)
-                .map(event -> sse("tool", event));
+                .map(event -> sse.event("tool", event));
 
         Flux<ServerSentEvent<String>> agentEvents = agentService.stream(message, conversationId, turnId)
                 .onErrorResume(error -> {
                     log.warn("对话调用失败", error);
                     return Flux.just(new AgentEvent.Error(AgentErrors.friendly(error)));
                 })
-                .map(this::toSse)
+                .map(sse::agent)
                 // 先让工具事件流结束，merge 才能正常收尾
                 .doFinally(signal -> eventBus.complete(turnId));
 
@@ -92,12 +92,16 @@ public class ChatController {
         meta.put("ragReady", knowledgeBase.isReady());
 
         return Flux.concat(
-                        Flux.just(sse("meta", meta)),
+                        Flux.just(sse.event("meta", meta)),
                         body,
-                        Flux.just(sse("done", Map.of("turnId", turnId))))
+                        Flux.just(sse.event("done", Map.of("turnId", turnId))))
                 .doFinally(signal -> {
                     eventBus.remove(turnId);
-                    agentEventBus.remove(turnId);
+                    // 如果本轮停在工具确认上，先不要清掉 Agent 事件通道：
+                    // 用户可能马上点确认，新的 SSE 连接会复用它。
+                    if (!agentService.hasPendingApproval(conversationId)) {
+                        agentEventBus.remove(turnId);
+                    }
                 });
     }
 
@@ -114,6 +118,12 @@ public class ChatController {
         }
 
         String conversationId = request.safeConversationId();
+        if (agentService.hasPendingApproval(conversationId)) {
+            ResponseEntity<Map<String, Object>> conflict = ResponseEntity
+                    .status(HttpStatus.CONFLICT)
+                    .body(errorBody("该会话还有未处理的工具确认请求，请先允许或拒绝。"));
+            return Mono.just(conflict);
+        }
         String turnId = UUID.randomUUID().toString();
         eventBus.open(turnId);
 
@@ -124,6 +134,9 @@ public class ChatController {
                     body.put("reply", result.reply());
                     body.put("sources", result.sources());
                     body.put("toolCalls", eventBus.history(turnId));
+                    if (result.approval() != null) {
+                        body.put("approval", result.approval());
+                    }
                     return ResponseEntity.ok(body);
                 })
                 .subscribeOn(Schedulers.boundedElastic())
@@ -156,33 +169,6 @@ public class ChatController {
                 tool("listTodos", "查看待办", "列出当前会话的全部待办"),
                 tool("completeTodo", "完成待办", "标记并移除一条待办")));
         return body;
-    }
-
-    private ServerSentEvent<String> toSse(AgentEvent event) {
-        if (event instanceof AgentEvent.Delta delta) {
-            return sse("delta", Map.of("text", delta.text()));
-        }
-        if (event instanceof AgentEvent.Sources sources) {
-            return sse("sources", Map.of("sources", sources.sources()));
-        }
-        if (event instanceof AgentEvent.Checkpoint checkpoint) {
-            return sse("checkpoint", Map.of("checkpointId", checkpoint.checkpointId()));
-        }
-        AgentEvent.Error error = (AgentEvent.Error) event;
-        return sse("error", Map.of("message", error.message()));
-    }
-
-    private ServerSentEvent<String> sse(String event, Object payload) {
-        String json;
-        try {
-            json = objectMapper.writeValueAsString(payload);
-        } catch (JsonProcessingException e) {
-            json = "{\"message\":\"事件序列化失败\"}";
-        }
-        return ServerSentEvent.<String>builder()
-                .event(event)
-                .data(json)
-                .build();
     }
 
     private Map<String, Object> tool(String name, String label, String description) {
